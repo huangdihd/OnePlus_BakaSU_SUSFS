@@ -32,6 +32,11 @@ inputs:
     required: false
     type: string
     default: O2
+  mlgo:
+    description: 'Do you want to enable mlgo? [Machine Learning Guided Optimization]'
+    required: false
+    type: boolean
+    default: true
   clean:
     description: 'Force clean build without ccache acceleration'
     required: false
@@ -143,6 +148,7 @@ runs:
         ds="$OP_DS"
         ntsync="$OP_NTSYNC"
         optimize='${{ inputs.optimize_level }}'
+        mlgo='${{ inputs.mlgo }}'
         
         errors=()
         
@@ -283,6 +289,11 @@ runs:
         case "$optimize" in
           O2|O3) ;;
           *) errors+=("optimize_level must be O2 or O3. Got: '$optimize'"); ;;
+        esac
+
+        case "${mlgo}" in
+          true|false) ;;
+          *) errors+=("mlgo must be 'true' or 'false'. Got: '${mlgo}'"); ;;
         esac
         
         if [ ${#errors[@]} -ne 0 ]; then
@@ -1000,6 +1011,60 @@ runs:
         echo "✅ BakaSU added (commit: ${KSU_COMMIT_SHA:0:8})"
         echo "::endgroup::"
 
+    - name: Apply upstream kernel compat fixes (non-SUSFS rules)
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "::group::Apply upstream kernel compat fixes"
+        # Upstream moved several plain kernel fixes (not SUSFS context shims)
+        # into scripts/kernel_fix_patches/apply_kernel_compat.py. This fork keeps
+        # its own SUSFS patching logic, so only run the standalone kernel-fix
+        # rules here; SUSFS-specific temp/revert rules are intentionally skipped.
+        COMPAT_PY="${GITHUB_WORKSPACE}/action-source/scripts/kernel_fix_patches/apply_kernel_compat.py"
+        SUBLEVEL="${TKERNEL_VER##*.}"
+        if ! [[ "$SUBLEVEL" =~ ^[0-9]+$ ]]; then
+          echo "::error::could not parse SUBLEVEL from TKERNEL_VER=$TKERNEL_VER"
+          exit 1
+        fi
+        python3 - "$COMPAT_PY" "$COMMON_KERNEL_FOLDER" "${ANDROID_VER}-${KERNEL_VER}" "$SUBLEVEL" "${OP_SOC:-}" "${RUNNER_TEMP}/kernel-compat-state.json" <<'PY'
+        import importlib.util
+        import sys
+        from pathlib import Path
+
+        compat_py, root, kmi, sublevel, soc, state = sys.argv[1:7]
+        spec = importlib.util.spec_from_file_location("apply_kernel_compat", compat_py)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["apply_kernel_compat"] = mod
+        spec.loader.exec_module(mod)
+
+        wanted = {
+            "mtk-tfa98xx-firmware-dotdot-exception",
+            "dont-export-test-task-ux",
+            "oneplus-nord5-align-kabi-ce5",
+        }
+        mod.RULES = tuple(r for r in mod.RULES if r.rule_id in wanted)
+        missing = wanted - {r.rule_id for r in mod.RULES}
+        if missing:
+            mod.log(f"warning: rules not found upstream: {sorted(missing)}")
+
+        ctx = mod.Context(
+            root=Path(root).resolve(),
+            kmi=kmi,
+            sublevel=int(sublevel),
+            soc=soc,
+            state_path=Path(state),
+            state=mod.load_state(Path(state)),
+        )
+        mod.log(f"stage=1 (non-SUSFS rules only), kmi={kmi}, sublevel={sublevel}, soc={soc or 'any'}")
+        try:
+            mod.run_stage(ctx, 1)
+            ctx.save_state()
+        except mod.CompatError as exc:
+            print(f"::error::kernel compat fix failed: {exc}", file=sys.stderr)
+            sys.exit(1)
+        PY
+        echo "::endgroup::"
+
     - name: Apply SUSFS Patches
       shell: bash
       if: ${{ env.OP_SUSFS == 'true' }}
@@ -1044,7 +1109,7 @@ runs:
               echo "ℹ️ Skipping KernelSU folder patch for BakaSU"
             fi
             ;;
-          "v2.2.0"|"v2.3.0")
+          "v2.2.0"|"v2.3.0"|"v2.4.0")
             if [ "${{ inputs.ksu_type }}" = "KSU" ]; then
               cd "$KSU_FOLDER"
               patch -p1 --forward < "$SUSFS_FOLDER/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" || true
@@ -1406,6 +1471,7 @@ runs:
         CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
         CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
         CONFIG_KSU_SUSFS_SUS_MAP=y
+        CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER=y
         CONFIG_KSU_SUSFS_SUS_SU=n
         EOF
         
@@ -1482,7 +1548,7 @@ runs:
           echo "Patching hmbird!"
           HMBIRD_MODEL=$(echo "$OP_MODEL" | sed 's/-[0-9]\+\.[0-9]\+\.[0-9]\+$//')
           case "$OP_MODEL" in
-            OP-ACE-5-ULTRA-6.6.50|OP-ACE-5-PRO-6.6.30|OP13-6.6.30|OP13-CPH-6.6.56|OP13T-6.6.89|OP13-6.6.89|OP-ACE-5-PRO-6.6.89|OP-PAD-2-PRO-6.6.89|OP-PAD-3-SM8750-6.6.89|OP-ACE-5-ULTRA-6.6.89|OP-ACE-6-6.6.89)
+            OP-ACE-5-ULTRA-6.6.50|OP-ACE-5-PRO-6.6.30|OP13-6.6.30|OP13-CPH-6.6.56|OP13S-6.6.89|OP13T-6.6.89|OP13-6.6.89|OP-ACE-5-PRO-6.6.89|OP-PAD-2-PRO-6.6.89|OP-PAD-3-SM8750-6.6.89|OP-ACE-5-ULTRA-6.6.89|OP-ACE-6-6.6.89)
               FENGCHI_DIR="$KERNEL_PATCHES_FOLDER/oneplus/hmbird/deprecated" ;;
             *)
               FENGCHI_DIR="$KERNEL_PATCHES_FOLDER/oneplus/hmbird" ;;
@@ -2125,10 +2191,12 @@ runs:
         CONFIG_DEVTMPFS=y
         CONFIG_PID_NS=y
         CONFIG_POSIX_MQUEUE=y
-        CONFIG_NETFILTER_XT_TARGET_REJECT=y
+        CONFIG_IP_NF_TARGET_REJECT=y
+        CONFIG_IP6_NF_TARGET_REJECT=y
         CONFIG_NETFILTER_XT_TARGET_LOG=y
         CONFIG_NETFILTER_XT_MATCH_RECENT=y
         CONFIG_USER_NS=y
+        CONFIG_MACVLAN=y
         EOF
         
         patch -p1 < "$KERNEL_PATCHES_FOLDER/common/droidspaces/0001-Guard-USER_NS-for-non-root-users.patch"
@@ -2278,6 +2346,26 @@ runs:
         MPMAP="-fmacro-prefix-map=${WORKSPACE}=."
         FPMAP="-ffile-prefix-map=${WORKSPACE}=."
         
+        # 
+        # add_kcflag() - append kcflags without failing build in case flag is not supported
+        # @args - flags to be appended
+        # 
+        # usage : 
+        #       add_kcflag flag1 flag2 ...
+        #
+        function add_kcflag() {                                    
+          if printf 'int g(int a){return a+1;} int f(int a){return g(a)*2;}\n' \
+            | clang --target=aarch64-linux-gnu -O2 "$@" -x c - -c -o /dev/null 2>/dev/null; then
+            KCFLAGS="${KCFLAGS:+$KCFLAGS }$*"
+          else
+            echo "::warning::clang rejected flag(s), skipping: $*"
+          fi
+        }
+
+        if [[ "${{ inputs.mlgo }}" = "true" ]]; then
+          add_kcflag -mllvm -regalloc-enable-advisor=release
+        fi
+
         export KCFLAGS="${KCFLAGS:-} $MAP $MPMAP $FPMAP -no-canonical-prefixes -fdiagnostics-color=never -Qunused-arguments -Wno-unused-command-line-argument -D__ANDROID_COMMON_KERNEL__"
         export KCPPFLAGS="${KCPPFLAGS:-} $MAP $MPMAP $FPMAP"
         
@@ -2382,11 +2470,11 @@ runs:
             ;;
         esac
 
-        # The N6X vendor defconfig builds OPLUS_NFC together with the external
+        # The N6X / N6 vendor defconfigs build OPLUS_NFC together with the external
         # OPLUS_FEATURE_OPROJECT module. A GKI-only build has no project module,
         # so the driver's default-y setting otherwise leaves unresolved symbols.
         case "$OP_MODEL" in
-          OP-N6X|OP-N6X-*)
+          OP-N6X|OP-N6X-*|OP-N6|OP-N6-*)
             scripts/config --file "$OUT/.config" -d OPLUS_NFC
             ;;
         esac
