@@ -9,7 +9,7 @@ on:
 
 jobs:
   prepare-release:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -45,7 +45,7 @@ jobs:
           fi
 
   generate-mirror-matrix:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: prepare-release
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
@@ -161,7 +161,7 @@ jobs:
   mirror-to-release:
     name: build (${{ matrix.type_label }}, ${{ matrix.rev }})
     needs: [prepare-release, generate-mirror-matrix]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.generate-mirror-matrix.outputs.matrix) }}
